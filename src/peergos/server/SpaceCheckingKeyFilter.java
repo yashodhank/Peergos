@@ -34,8 +34,6 @@ public class SpaceCheckingKeyFilter  {
     private Function<String, Long> quotaSupplier;
     private final Path statePath;
     private final State state;
-    private final Map<PublicKeyHash, Stat> currentView;
-    private final Map<String, Usage> usage;
 
     public static class State implements Cborable {
         final Map<PublicKeyHash, Stat> currentView;
@@ -250,8 +248,6 @@ public class SpaceCheckingKeyFilter  {
         this.quotaSupplier = quotaSupplier;
         this.statePath = statePath;
         this.state = initState();
-        this.currentView  = state.currentView;
-        this.usage = state.usage;
     }
 
     /**
@@ -260,7 +256,7 @@ public class SpaceCheckingKeyFilter  {
     private State initState() throws IOException {
         State state = null;
         try {
-            // Read stored usages and udate current view.
+            // Read stored usages and update current view.
             state = load();
             System.out.println("Successfully loaded usage-state from "+ this.statePath);
         } catch (IOException ioe) {
@@ -285,7 +281,7 @@ public class SpaceCheckingKeyFilter  {
                         .filter(key -> !stat.ownedKeys.contains(key))
                         .collect(Collectors.toList());
                     for (PublicKeyHash newOwnedKey : newOwnedKeys) {
-                        currentView.putIfAbsent(newOwnedKey, new Stat(stat.owner, MaybeMultihash.empty(), 0, Collections.emptySet()));
+                        state.currentView.putIfAbsent(newOwnedKey, new Stat(stat.owner, MaybeMultihash.empty(), 0, Collections.emptySet()));
                         processMutablePointerEvent(newOwnedKey, MaybeMultihash.empty(), mutable.getPointerTarget(newOwnedKey, dht).get());
                     }
                     stat.update(rootHash, directOwnedKeys, updatedSize);
@@ -297,15 +293,13 @@ public class SpaceCheckingKeyFilter  {
         calculateUsage();
         //add shutdown-hook to call close
         Runtime.getRuntime().addShutdownHook(new Thread(this::close));
-        //remove state-path
-        Files.deleteIfExists(statePath);
         return state;
     }
 
     /**
      * Write current view of usages to this.statePath, completing any pending operations
      */
-    private void close() {
+    private synchronized void close() {
         try {
             store();
             System.out.println("Successfully stored usage-state to " + this.statePath);
@@ -330,7 +324,7 @@ public class SpaceCheckingKeyFilter  {
      * Store usages
      * @throws IOException
      */
-    private void store() throws IOException {
+    private synchronized void store() throws IOException {
         byte[] serialized = state.toCbor().serialize();
         System.out.println("Writing "+ serialized.length +" bytes to "+ statePath);
         Files.write(
@@ -340,13 +334,13 @@ public class SpaceCheckingKeyFilter  {
     }
 
     /**
-     * Walk the virtual file-system to calculate space used by each owner.
+     * Walk the virtual file-system to calculate space used by each owner not already checked
      */
     private void calculateUsage() {
         try {
             List<String> usernames = core.getUsernames("").get()
                 .stream()
-                .filter(usage::containsKey)
+                .filter(e ->! state.usage.containsKey(e))
                 .collect(Collectors.toList());
             long t1 = System.currentTimeMillis();
             for (String username : usernames) {
@@ -361,8 +355,8 @@ public class SpaceCheckingKeyFilter  {
     }
 
     public void accept(CorenodeEvent event) {
-        currentView.computeIfAbsent(event.keyHash, k -> new Stat(event.username, MaybeMultihash.empty(), 0, Collections.emptySet()));
-        usage.putIfAbsent(event.username, new Usage(0));
+        state.currentView.computeIfAbsent(event.keyHash, k -> new Stat(event.username, MaybeMultihash.empty(), 0, Collections.emptySet()));
+        state.usage.putIfAbsent(event.username, new Usage(0));
         ForkJoinPool.commonPool().submit(() -> processCorenodeEvent(event.username, event.keyHash));
     }
 
@@ -373,10 +367,10 @@ public class SpaceCheckingKeyFilter  {
      */
     public void processCorenodeEvent(String username, PublicKeyHash ownedKeyHash) {
         try {
-            usage.putIfAbsent(username, new Usage(0));
+            state.usage.putIfAbsent(username, new Usage(0));
             Set<PublicKeyHash> childrenKeys = WriterData.getDirectOwnedKeys(ownedKeyHash, mutable, dht);
-            currentView.computeIfAbsent(ownedKeyHash, k -> new Stat(username, MaybeMultihash.empty(), 0, childrenKeys));
-            Stat current = currentView.get(ownedKeyHash);
+            state.currentView.computeIfAbsent(ownedKeyHash, k -> new Stat(username, MaybeMultihash.empty(), 0, childrenKeys));
+            Stat current = state.currentView.get(ownedKeyHash);
             MaybeMultihash updatedRoot = mutable.getPointerTarget(ownedKeyHash, dht).get();
             processMutablePointerEvent(ownedKeyHash, current.target, updatedRoot);
             for (PublicKeyHash childKey : childrenKeys) {
@@ -402,7 +396,7 @@ public class SpaceCheckingKeyFilter  {
     public void processMutablePointerEvent(PublicKeyHash writer, MaybeMultihash existingRoot, MaybeMultihash newRoot) {
         if (existingRoot.equals(newRoot))
             return;
-        Stat current = currentView.get(writer);
+        Stat current = state.currentView.get(writer);
         if (current == null)
             throw new IllegalStateException("Unknown writer key hash: " + writer);
         if (! newRoot.isPresent()) {
@@ -424,9 +418,9 @@ public class SpaceCheckingKeyFilter  {
                 long changeInStorage = dht.getChangeInContainedSize(current.target, newRoot.get()).get();
                 Set<PublicKeyHash> updatedOwned = WriterData.getWriterData(writer, newRoot, dht).get().props.ownedKeys;
                 for (PublicKeyHash owned : updatedOwned) {
-                    currentView.computeIfAbsent(owned, k -> new Stat(current.owner, MaybeMultihash.empty(), 0, Collections.emptySet()));
+                    state.currentView.computeIfAbsent(owned, k -> new Stat(current.owner, MaybeMultihash.empty(), 0, Collections.emptySet()));
                 }
-                Usage currentUsage = usage.get(current.owner);
+                Usage currentUsage = state.usage.get(current.owner);
                 currentUsage.confirmUsage(writer, changeInStorage);
 
                 HashSet<PublicKeyHash> removedChildren = new HashSet<>(current.getOwnedKeys());
@@ -451,13 +445,13 @@ public class SpaceCheckingKeyFilter  {
     }
 
     public boolean allowWrite(PublicKeyHash writer, int size) {
-        Stat state = currentView.get(writer);
-        if (state == null)
+        Stat stat = state.currentView.get(writer);
+        if (stat == null)
             throw new IllegalStateException("Unknown writing key hash: " + writer);
 
-        Usage usage = this.usage.get(state.owner);
+        Usage usage = state.usage.get(stat.owner);
         long spaceUsed = usage.usage();
-        long quota = quotaSupplier.apply(state.owner);
+        long quota = quotaSupplier.apply(stat.owner);
         if (spaceUsed > quota || quota - spaceUsed - size <= 0) {
             long pending = usage.getPending(writer);
             usage.clearPending(writer);

@@ -105,7 +105,7 @@ public interface CborObject extends Cborable {
         }
     }
 
-    final class CborMap implements CborObject{
+    final class CborMap implements CborObject {
         public final SortedMap<CborObject,? extends Cborable> values;
 
         public CborMap(SortedMap<CborObject,? extends Cborable> values) {
@@ -121,7 +121,6 @@ public interface CborObject extends Cborable {
                             (a, b) -> a, TreeMap::new));
             return new CborMap(transformed);
         }
-
 
         @Override
         public void serialize(CborEncoder encoder) {
